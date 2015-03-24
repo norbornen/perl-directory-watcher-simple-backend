@@ -1,0 +1,98 @@
+#!/usr/bin/perl
+
+use common::sense;
+
+use Getopt::Long;
+use App::Daemon qw( daemonize );
+use HTTP::Daemon;
+use Data::Dumper;
+use threads;
+use threads::shared;
+use Linux::Inotify2;
+
+GetOptions('log:s'=>\my $log);
+
+$App::Daemon::logfile = $log || '/dev/null';
+$App::Daemon::pidfile = '/var/run/rpcHtmlLightServer.pid';
+$App::Daemon::as_user = 'httpd';
+
+daemonize();
+
+if ($log) {
+  open(STDIN,  "+>>" . $log) or die "Can't open STDIN:  $!";
+  open(STDOUT, "+>&STDIN")            or die "Can't open STDOUT: $!";
+  open(STDERR, "+>&STDIN")            or die "Can't open STDERR: $!";
+}
+
+
+
+our %inputQFiles :shared;
+
+#
+# начинаем следить за жизнью каталога /path/to/inputq
+#
+my $inputQDir = '/path/to/inputq';
+my $inotify = new Linux::Inotify2 or die "Unable to create new inotify object: $!";
+$inotify->watch ($inputQDir, IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO);
+
+#
+# вешаем асинхронную обработку изменений в каталоге $inputQDir
+# при каждом изменении обновляем список файлов в переменной $inputQFiles
+# 
+async{
+  #
+  # вешаем наблюдателя за каталогом /usr/local/stack/db/data/vor/inputq
+  #
+  while () {
+    my @events = $inotify->read;
+    if (@events > 0) {
+      %inputQFiles = ();
+      my $file_list = qx|ls $inputQDir|;
+      foreach my $f (split /\n/, $file_list) {
+        if ($f =~ /(\d+)\.q$/) {
+          $inputQFiles{$1}++;
+        }
+      }
+    }
+  }
+};
+
+
+startHTTPDaemon(host=>'localhost', port=>'1234');
+
+#----------------------------------------------------------------------------------------------------------------------------
+sub startHTTPDaemon {
+  my %opts = @_;
+  
+  my $d = HTTP::Daemon->new(
+      LocalAddr => $opts{host},
+      LocalPort => $opts{port},
+      Reuse     => 1,
+  ) or die "Couldn't create daemon on port $opts{host}:$opts{port}.";
+  print "Please contact me at: ", $d->url, "\n";
+
+  while (my $c = $d->accept) {
+    while (my $request = $c->get_request) {
+      my ($code, $answer) = (200, '{"total": "'.scalar(keys %inputQFiles).'"}');
+      requestLog($request->header('x-forwarded-for'), $request->method, $code, $$request->uri->path);
+      my $response = HTTP::Response->new;
+      $response->code($code);
+      $response->content($answer);
+      $c->send_response($response);
+    }
+  
+    $c->close;
+    undef $c;
+  }
+}
+sub requestLog {
+  my ($s, $m, $h, $day, $mon, $year) = (localtime)[0 .. 5];
+  my $time = sprintf("%04d-%02d-%02d %02d:%02d:%02d", (1900 + $year), (1 + $mon), $day, $h, $m, $s);
+  
+  say join "\t", $time, @_; 
+}
+
+
+##
+##
+1;
